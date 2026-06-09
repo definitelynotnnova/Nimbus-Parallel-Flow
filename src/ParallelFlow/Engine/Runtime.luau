@@ -2,6 +2,7 @@ local Runtime = {}
 
 local cache = {}
 local history = {}
+local warmedUp = {}
 local MAX_CACHE = 50
 
 -- helper to get and cache modules
@@ -15,7 +16,10 @@ local function loadModule(mod, idx)
 	if ok then
 		if #history >= MAX_CACHE then
 			local old = table.remove(history, 1)
-			if old then cache[old] = nil end
+			if old then 
+				cache[old] = nil 
+				warmedUp[old] = nil
+			end
 		end
 		cache[mod] = fn
 		table.insert(history, mod)
@@ -23,7 +27,7 @@ local function loadModule(mod, idx)
 		warn("worker " .. idx .. " couldn't load module: " .. tostring(fn))
 	end
 	task.desynchronize()
-	
+
 	return cache[mod]
 end
 
@@ -44,20 +48,36 @@ function Runtime.start(actor, Lib)
 		warn("worker " .. actor.Name .. " is missing the result event")
 		return
 	end
-	
+
 	local event = ref.Value
 	local Serializer = Lib -- using the injected serializer
 
 	-- standard dispatch
 	actor:BindToMessageParallel("pf_task", function(mod, args)
+		local t0 = os.clock()
 		local fn = loadModule(mod, wid)
 		if not fn then return end
 
 		local raw = Serializer.decode(args)
-		local ok, res = pcall(fn, raw)
 
 		task.synchronize()
+		actor:SetAttribute("PF_Busy", true)
+		task.desynchronize()
+
+		local ok, res = pcall(fn, raw)
+
+		local elapsed = (os.clock() - t0) * 1000
+		task.synchronize()
+		actor:SetAttribute("PF_Busy", false)
+		actor:SetAttribute("PF_LastRunMs", elapsed)
 		event:Fire(wid, ok and Serializer.encode(res) or nil, ok)
+	end)
+
+	-- explicit warmup (eliminates load/sync cost from first real run)
+	actor:BindToMessageParallel("pf_warmup", function(mod)
+		if warmedUp[mod] then return end
+		loadModule(mod, wid)
+		warmedUp[mod] = true
 	end)
 
 	task.synchronize()
@@ -65,6 +85,7 @@ function Runtime.start(actor, Lib)
 
 	-- basic parallel map
 	actor:BindToMessageParallel("pf_map", function(mod, buf)
+		local t0 = os.clock()
 		local fn = loadModule(mod, wid)
 		if not fn then return end
 
@@ -80,12 +101,15 @@ function Runtime.start(actor, Lib)
 			if ok then out[i] = res else failed = true break end
 		end
 
+		local elapsed = (os.clock() - t0) * 1000
 		task.synchronize()
+		actor:SetAttribute("PF_LastRunMs", elapsed)
 		event:Fire(wid, not failed and Serializer.encode(out) or nil, not failed)
 	end)
 
 	-- sharedtable map
 	actor:BindToMessageParallel("pf_map_shared", function(mod, start, finish, shared)
+		local t0 = os.clock()
 		local fn = loadModule(mod, wid)
 		if not fn then return end
 
@@ -99,12 +123,15 @@ function Runtime.start(actor, Lib)
 			if ok then out[i] = res else failed = true break end
 		end
 
+		local elapsed = (os.clock() - t0) * 1000
 		task.synchronize()
+		actor:SetAttribute("PF_LastRunMs", elapsed)
 		event:Fire(wid, not failed and Serializer.encode(out) or nil, not failed)
 	end)
 
 	-- binary buffer map
 	actor:BindToMessageParallel("pf_map_buffer", function(mod, buf, stride)
+		local t0 = os.clock()
 		local fn = loadModule(mod, wid)
 		if not fn then return end
 
@@ -117,12 +144,15 @@ function Runtime.start(actor, Lib)
 			if ok then out[i] = res else failed = true break end
 		end
 
+		local elapsed = (os.clock() - t0) * 1000
 		task.synchronize()
+		actor:SetAttribute("PF_LastRunMs", elapsed)
 		event:Fire(wid, not failed and Serializer.encode(out) or nil, not failed)
 	end)
 
 	-- map directly into a target table
 	actor:BindToMessageParallel("pf_map_into", function(mod, start, finish, data, target)
+		local t0 = os.clock()
 		local fn = loadModule(mod, wid)
 		if not fn then return end
 
@@ -141,12 +171,15 @@ function Runtime.start(actor, Lib)
 			if ok then target[start + i - 1] = res else failed = true break end
 		end
 
+		local elapsed = (os.clock() - t0) * 1000
 		task.synchronize()
+		actor:SetAttribute("PF_LastRunMs", elapsed)
 		event:Fire(wid, nil, not failed)
 	end)
 
 	-- binary in, binary out
 	actor:BindToMessageParallel("pf_map_buffer_out", function(mod, buf, stride, outStride)
+		local t0 = os.clock()
 		local fn = loadModule(mod, wid)
 		if not fn then return end
 
@@ -159,8 +192,10 @@ function Runtime.start(actor, Lib)
 			if not success then ok = false break end
 		end
 
+		local elapsed = (os.clock() - t0) * 1000
 		task.synchronize()
-		event:Fire(wid, ok and res or nil, ok)
+		actor:SetAttribute("PF_LastRunMs", elapsed)
+		event:Fire(wid, ok and Serializer.encode(res) or nil, ok)
 	end)
 end
 
