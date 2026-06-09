@@ -1,27 +1,61 @@
--- binary serializer for cross-actor data
+--!strict
 local lib = {}
+local TypeCodecs = require(script.Parent.TypeCodecs)
 
-local T_NUM  = 1
-local T_BOOL = 2
-local T_STR  = 3
-local T_V3   = 4
-local T_CF   = 5
-local T_ARR  = 6
-local T_NIL  = 7
-local T_INT  = 8
-local T_MAP  = 9
-local T_ANUM = 10
-local T_AV3  = 11
-local T_BUF  = 12
+-- binary serializer for cross-actor data
+
+local T_NUM   = 1
+local T_BOOL  = 2
+local T_STR   = 3
+local T_V3    = 4
+local T_CF    = 5
+local T_ARR   = 6
+local T_NIL   = 7
+local T_INT   = 8
+local T_MAP   = 9
+local T_ANUM  = 10
+local T_AV3   = 11
+local T_BUF   = 12
+local T_ACF   = 13
+local T_SMAP  = 14
 
 local pool = buffer.create(4096)
 local size = 4096
 local pos = 0
 
+-- fast lookup for centralized codecs
+local registry = TypeCodecs._getRegistry()
+local typeMap: {[string]: {id: number, stride: number, encode: any, decode: any}} = {}
+
+-- map legacy IDs to their codecs
+typeMap["Vector3"] = {id = T_V3, stride = 12, encode = registry.Vector3.encode, decode = registry.Vector3.decode}
+typeMap["CFrame"] = {id = T_CF, stride = 48, encode = registry.CFrame.encode, decode = registry.CFrame.decode}
+
+-- cache commonly used locals
+local encodeV3 = typeMap.Vector3.encode
+local encodeCF = typeMap.CFrame.encode
+
+-- populate the rest of the codecs with generic IDs (starting from 50 to avoid any overlap)
+local nextId = 50
+for name, codec in registry do
+	if name == "Vector3" or name == "CFrame" then continue end
+	typeMap[name] = {
+		id = nextId,
+		stride = codec.stride,
+		encode = codec.encode,
+		decode = codec.decode
+	}
+	nextId += 1
+end
+
+-- reverse lookup for decoding
+local idToCodec = {}
+for name, info in typeMap do idToCodec[info.id] = info end
+
 -- make sure we have enough space in our buffer
 local function grow(n)
 	if pos + n > size then
-		local new = math.max(size * 2, pos + n)
+		local new = math.max(math.floor(size * 1.5), pos + n)
 		local nb = buffer.create(new)
 		buffer.copy(nb, 0, pool, 0, pos)
 		pool, size = nb, new
@@ -60,33 +94,9 @@ local function write(v)
 		buffer.writeu32(pool, pos + 1, len)
 		buffer.writestring(pool, pos + 5, v)
 		pos += 5 + len
-	elseif typeof(v) == "Vector3" then
-		grow(13)
-		buffer.writeu8(pool, pos, T_V3)
-		buffer.writef32(pool, pos + 1, v.X)
-		buffer.writef32(pool, pos + 5, v.Y)
-		buffer.writef32(pool, pos + 9, v.Z)
-		pos += 13
-	elseif typeof(v) == "buffer" then
-		local len = buffer.len(v)
-		grow(5 + len)
-		buffer.writeu8(pool, pos, T_BUF)
-		buffer.writeu32(pool, pos + 1, len)
-		buffer.copy(pool, pos + 5, v, 0, len)
-		pos += 5 + len
-	elseif typeof(v) == "CFrame" then
-		grow(49)
-		buffer.writeu8(pool, pos, T_CF)
-		local x, y, z, r00, r01, r02, r10, r11, r12, r20, r21, r22 = v:GetComponents()
-		buffer.writef32(pool, pos + 1, x); buffer.writef32(pool, pos + 5, y); buffer.writef32(pool, pos + 9, z)
-		buffer.writef32(pool, pos + 13, r00); buffer.writef32(pool, pos + 17, r01); buffer.writef32(pool, pos + 21, r02)
-		buffer.writef32(pool, pos + 25, r10); buffer.writef32(pool, pos + 29, r11); buffer.writef32(pool, pos + 33, r12)
-		buffer.writef32(pool, pos + 37, r20); buffer.writef32(pool, pos + 41, r21); buffer.writef32(pool, pos + 45, r22)
-		pos += 49
 	elseif t == "table" then
 		local n = #v
 		if n > 0 or next(v) == nil then
-			-- check if we can use fast arrays
 			if n > 8 then
 				local first = v[1]
 				if type(first) == "number" then
@@ -101,31 +111,65 @@ local function write(v)
 					buffer.writeu8(pool, pos, T_AV3)
 					buffer.writeu32(pool, pos + 1, n)
 					pos += 5
-					for i = 1, n do
-						local vec = v[i]
-						buffer.writef32(pool, pos, vec.X); buffer.writef32(pool, pos + 4, vec.Y); buffer.writef32(pool, pos + 8, vec.Z)
-						pos += 12
-					end
+					for i = 1, n do encodeV3(pool, pos, v[i]); pos += 12 end
+					return
+				elseif typeof(first) == "CFrame" then
+					grow(5 + n * 48)
+					buffer.writeu8(pool, pos, T_ACF)
+					buffer.writeu32(pool, pos + 1, n)
+					pos += 5
+					for i = 1, n do encodeCF(pool, pos, v[i]); pos += 48 end
 					return
 				end
 			end
-			-- generic array
 			grow(5)
 			buffer.writeu8(pool, pos, T_ARR)
 			buffer.writeu32(pool, pos + 1, n)
 			pos += 5
 			for i = 1, n do write(v[i]) end
 		else
-			-- dictionary
 			grow(5)
 			buffer.writeu8(pool, pos, T_MAP)
 			local count = 0; for _ in v do count += 1 end
 			buffer.writeu32(pool, pos + 1, count); pos += 5
 			for k, val in v do write(k); write(val) end
 		end
+	elseif typeof(v) == "buffer" then
+		local len = buffer.len(v)
+		grow(5 + len)
+		buffer.writeu8(pool, pos, T_BUF)
+		buffer.writeu32(pool, pos + 1, len)
+		buffer.copy(pool, pos + 5, v, 0, len)
+		pos += 5 + len
 	else
-		warn("unsupported type: " .. t)
-		grow(1); buffer.writeu8(pool, pos, T_NIL); pos += 1
+		-- roblox type centralization
+		local typeName = typeof(v)
+		local info = typeMap[typeName]
+		if info then
+			local stride = info.stride
+			if stride > 0 then
+				grow(1 + stride)
+				buffer.writeu8(pool, pos, info.id)
+				info.encode(pool, pos + 1, v)
+				pos += 1 + stride
+			else
+				-- variable length (sequences)
+				grow(1024)
+				buffer.writeu8(pool, pos, info.id)
+				local startPos = pos + 1
+				info.encode(pool, startPos, v)
+				if typeName == "ColorSequence" then
+					pos = startPos + 1 + (#(v :: any).Keypoints * 16)
+				elseif typeName == "NumberSequence" then
+					pos = startPos + 1 + (#(v :: any).Keypoints * 12)
+				else
+					pos = startPos + 1 -- fallback for empty or unknown var-len
+				end
+			end
+		else
+			warn("unsupported type: " .. typeName)
+			grow(1); buffer.writeu8(pool, pos, T_NIL); pos += 1
+		end
 	end
 end
 
@@ -141,14 +185,6 @@ local function read(buf, offset)
 	elseif id == T_STR then
 		local len = buffer.readu32(buf, offset)
 		return buffer.readstring(buf, offset + 4, len), offset + 4 + len
-	elseif id == T_V3 then
-		return Vector3.new(buffer.readf32(buf, offset), buffer.readf32(buf, offset + 4), buffer.readf32(buf, offset + 8)), offset + 12
-	elseif id == T_CF then
-		local x, y, z = buffer.readf32(buf, offset), buffer.readf32(buf, offset + 4), buffer.readf32(buf, offset + 8)
-		local r00 = buffer.readf32(buf, offset + 12); local r01 = buffer.readf32(buf, offset + 16); local r02 = buffer.readf32(buf, offset + 20)
-		local r10 = buffer.readf32(buf, offset + 24); local r11 = buffer.readf32(buf, offset + 28); local r12 = buffer.readf32(buf, offset + 32)
-		local r20 = buffer.readf32(buf, offset + 36); local r21 = buffer.readf32(buf, offset + 40); local r22 = buffer.readf32(buf, offset + 44)
-		return CFrame.new(x,y,z, r00,r01,r02, r10,r11,r12, r20,r21,r22), offset + 48
 	elseif id == T_ARR then
 		local n = buffer.readu32(buf, offset); offset += 4
 		local res = table.create(n)
@@ -164,20 +200,64 @@ local function read(buf, offset)
 		local res = table.create(n)
 		for i = 1, n do res[i] = buffer.readf64(buf, offset); offset += 8 end
 		return res, offset
-	elseif id == T_AV3 then
-		local n = buffer.readu32(buf, offset); offset += 4
-		local res = table.create(n)
-		for i = 1, n do
-			res[i] = Vector3.new(buffer.readf32(buf, offset), buffer.readf32(buf, offset + 4), buffer.readf32(buf, offset + 8))
-			offset += 12
-		end
-		return res, offset
 	elseif id == T_BUF then
 		local n = buffer.readu32(buf, offset); offset += 4
 		local res = buffer.create(n); buffer.copy(res, 0, buf, offset, n)
 		return res, offset + n
+	elseif id == T_AV3 then
+		local n = buffer.readu32(buf, offset); offset += 4
+		local res = table.create(n)
+		local decV3 = registry.Vector3.decode
+		for i = 1, n do res[i] = decV3(buf, offset); offset += 12 end
+		return res, offset
+	elseif id == T_ACF then
+		local n = buffer.readu32(buf, offset); offset += 4
+		local res = table.create(n)
+		local decCF = registry.CFrame.decode
+		for i = 1, n do res[i] = decCF(buf, offset); offset += 48 end
+		return res, offset
+	elseif id == T_SMAP then
+		local n = buffer.readu32(buf, offset)
+		local keyCount = buffer.readu8(buf, offset + 4)
+		offset += 5
+		local keys = table.create(keyCount)
+		for i = 1, keyCount do
+			local key; key, offset = read(buf, offset)
+			keys[i] = key
+		end
+		local res = table.create(n)
+		for i = 1, n do
+			local item = {}
+			for j = 1, keyCount do
+				local val; val, offset = read(buf, offset)
+				item[keys[j]] = val
+			end
+			res[i] = item
+		end
+		return res, offset
+	else
+		-- centralized numeric ID lookup
+		local info = idToCodec[id]
+		if info then
+			local res = info.decode(buf, offset)
+			local stride = info.stride
+			if stride > 0 then
+				offset += stride
+			else
+				-- variable length offset reconstruction
+				local count = buffer.readu8(buf, offset)
+				if info.id == typeMap.ColorSequence.id then
+					offset += 1 + count * 16
+				elseif info.id == typeMap.NumberSequence.id then
+					offset += 1 + count * 12
+				else
+					offset += 1
+				end
+			end
+			return res, offset
+		end
 	end
-	
+
 	warn("unknown type id: " .. id)
 	return nil, offset
 end
@@ -186,6 +266,47 @@ function lib.encode(v, startIdx, endIdx)
 	pos = 0
 	if startIdx and endIdx and type(v) == "table" then
 		local n = endIdx - startIdx + 1
+
+		-- V16 Schema Compression Detection
+		local first = v[startIdx]
+		if type(first) == "table" and next(first) ~= nil and first[1] == nil then
+			local keys = {}
+			local keyCount = 0
+			for k in first do
+				table.insert(keys, k)
+				keyCount += 1
+			end
+
+			if keyCount < 256 then
+				local homogeneous = true
+				for i = startIdx + 1, endIdx do
+					local item = v[i]
+					if type(item) ~= "table" then homogeneous = false; break end
+					local count = 0
+					for k in item do
+						if first[k] == nil then homogeneous = false; break end
+						count += 1
+					end
+					if count ~= keyCount then homogeneous = false; break end
+				end
+
+				if homogeneous then
+					grow(6)
+					buffer.writeu8(pool, pos, T_SMAP)
+					buffer.writeu32(pool, pos + 1, n)
+					buffer.writeu8(pool, pos + 5, keyCount)
+					pos += 6
+					for _, k in keys do write(k) end
+					for i = startIdx, endIdx do
+						local item = v[i]
+						for _, k in keys do write(item[k]) end
+					end
+					local res = buffer.create(pos); buffer.copy(res, 0, pool, 0, pos)
+					return res
+				end
+			end
+		end
+
 		grow(5); buffer.writeu8(pool, pos, T_ARR); buffer.writeu32(pool, pos + 1, n); pos += 5
 		for i = startIdx, endIdx do write(v[i]) end
 	else
@@ -212,9 +333,29 @@ function lib.packVector3s(data)
 	local res = buffer.create(n * 12)
 	for i = 1, n do
 		local v = data[i]; local off = (i-1)*12
-		buffer.writef32(res, off, v.X); buffer.writef32(res, off+4, v.Y); buffer.writef32(res, off+8, v.Z)
+		encodeV3(res, off, v)
 	end
 	return res
+end
+
+function lib.estimateSize(v)
+	local t = type(v)
+	if t == "number" then return 9
+	elseif t == "boolean" then return 2
+	elseif t == "string" then return 5 + #v
+	elseif t == "table" then
+		local s = 5; for k, val in v do s += lib.estimateSize(k) + lib.estimateSize(val) end
+		return s
+	elseif typeof(v) == "buffer" then return 5 + buffer.len(v)
+	else
+		local info = typeMap[typeof(v)]
+		if info then
+			if info.stride > 0 then return 1 + info.stride end
+			if info.id == typeMap.ColorSequence.id then return 2 + #(v :: any).Keypoints * 16 end
+			if info.id == typeMap.NumberSequence.id then return 2 + #(v :: any).Keypoints * 12 end
+		end
+	end
+	return 1
 end
 
 return lib
