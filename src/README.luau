@@ -7,7 +7,7 @@ Core Allocation
 
 
 Adding workers beyond available cores does not improve throughput.
-In testing, pools 3-6 stayed near ~1.26x.
+In testing, pools 3-6 stayed near ~1.26x. 
 
 Parallel work is usually slower below ~50-100 elements, with light
 per-element work, or on single-core servers. The map heuristic already
