@@ -19,9 +19,26 @@ local T_BUF   = 12
 local T_ACF   = 13
 local T_SMAP  = 14
 
-local pool = buffer.create(4096)
-local size = 4096
-local pos = 0
+-- Each encode uses its own state (buf/size/pos) so concurrent or re-entrant
+-- encodes never corrupt a shared buffer. States are recycled via a small
+-- free-list to keep buffer reuse (no per-call allocation on the hot path).
+type EncState = { buf: buffer, size: number, pos: number }
+local freeStates: {EncState} = {}
+
+local function acquire(): EncState
+	local st = table.remove(freeStates)
+	if st then
+		st.pos = 0
+		return st
+	end
+	return { buf = buffer.create(4096), size = 4096, pos = 0 }
+end
+
+local function release(st: EncState)
+	if #freeStates < 8 then -- cap pooled buffers
+		freeStates[#freeStates + 1] = st
+	end
+end
 
 -- fast lookup for centralized codecs
 local registry = TypeCodecs._getRegistry()
@@ -52,95 +69,95 @@ end
 local idToCodec = {}
 for name, info in typeMap do idToCodec[info.id] = info end
 
--- make sure we have enough space in our buffer
-local function grow(n)
-	if pos + n > size then
-		local new = math.max(math.floor(size * 1.5), pos + n)
+-- make sure the encode state has enough space
+local function grow(st, n)
+	if st.pos + n > st.size then
+		local new = math.max(math.floor(st.size * 1.5), st.pos + n)
 		local nb = buffer.create(new)
-		buffer.copy(nb, 0, pool, 0, pos)
-		pool, size = nb, new
+		buffer.copy(nb, 0, st.buf, 0, st.pos)
+		st.buf, st.size = nb, new
 	end
 end
 
--- write any value to the internal buffer
-local function write(v)
+-- write any value into the encode state's buffer
+local function write(st, v)
 	local t = type(v)
 
 	if v == nil then
-		grow(1)
-		buffer.writeu8(pool, pos, T_NIL)
-		pos += 1
+		grow(st, 1)
+		buffer.writeu8(st.buf, st.pos, T_NIL)
+		st.pos += 1
 	elseif t == "boolean" then
-		grow(2)
-		buffer.writeu8(pool, pos, T_BOOL)
-		buffer.writeu8(pool, pos + 1, v and 1 or 0)
-		pos += 2
+		grow(st, 2)
+		buffer.writeu8(st.buf, st.pos, T_BOOL)
+		buffer.writeu8(st.buf, st.pos + 1, v and 1 or 0)
+		st.pos += 2
 	elseif t == "number" then
 		if v == math.floor(v) and v >= -2147483648 and v <= 2147483647 then
-			grow(5)
-			buffer.writeu8(pool, pos, T_INT)
-			buffer.writei32(pool, pos + 1, v)
-			pos += 5
+			grow(st, 5)
+			buffer.writeu8(st.buf, st.pos, T_INT)
+			buffer.writei32(st.buf, st.pos + 1, v)
+			st.pos += 5
 		else
-			grow(9)
-			buffer.writeu8(pool, pos, T_NUM)
-			buffer.writef64(pool, pos + 1, v)
-			pos += 9
+			grow(st, 9)
+			buffer.writeu8(st.buf, st.pos, T_NUM)
+			buffer.writef64(st.buf, st.pos + 1, v)
+			st.pos += 9
 		end
 	elseif t == "string" then
 		local len = #v
-		grow(5 + len)
-		buffer.writeu8(pool, pos, T_STR)
-		buffer.writeu32(pool, pos + 1, len)
-		buffer.writestring(pool, pos + 5, v)
-		pos += 5 + len
+		grow(st, 5 + len)
+		buffer.writeu8(st.buf, st.pos, T_STR)
+		buffer.writeu32(st.buf, st.pos + 1, len)
+		buffer.writestring(st.buf, st.pos + 5, v)
+		st.pos += 5 + len
 	elseif t == "table" then
 		local n = #v
 		if n > 0 or next(v) == nil then
 			if n > 8 then
 				local first = v[1]
 				if type(first) == "number" then
-					grow(5 + n * 8)
-					buffer.writeu8(pool, pos, T_ANUM)
-					buffer.writeu32(pool, pos + 1, n)
-					pos += 5
-					for i = 1, n do buffer.writef64(pool, pos, v[i]); pos += 8 end
+					grow(st, 5 + n * 8)
+					buffer.writeu8(st.buf, st.pos, T_ANUM)
+					buffer.writeu32(st.buf, st.pos + 1, n)
+					st.pos += 5
+					for i = 1, n do buffer.writef64(st.buf, st.pos, v[i]); st.pos += 8 end
 					return
 				elseif typeof(first) == "Vector3" then
-					grow(5 + n * 12)
-					buffer.writeu8(pool, pos, T_AV3)
-					buffer.writeu32(pool, pos + 1, n)
-					pos += 5
-					for i = 1, n do encodeV3(pool, pos, v[i]); pos += 12 end
+					grow(st, 5 + n * 12)
+					buffer.writeu8(st.buf, st.pos, T_AV3)
+					buffer.writeu32(st.buf, st.pos + 1, n)
+					st.pos += 5
+					for i = 1, n do encodeV3(st.buf, st.pos, v[i]); st.pos += 12 end
 					return
 				elseif typeof(first) == "CFrame" then
-					grow(5 + n * 48)
-					buffer.writeu8(pool, pos, T_ACF)
-					buffer.writeu32(pool, pos + 1, n)
-					pos += 5
-					for i = 1, n do encodeCF(pool, pos, v[i]); pos += 48 end
+					grow(st, 5 + n * 48)
+					buffer.writeu8(st.buf, st.pos, T_ACF)
+					buffer.writeu32(st.buf, st.pos + 1, n)
+					st.pos += 5
+					for i = 1, n do encodeCF(st.buf, st.pos, v[i]); st.pos += 48 end
 					return
 				end
 			end
-			grow(5)
-			buffer.writeu8(pool, pos, T_ARR)
-			buffer.writeu32(pool, pos + 1, n)
-			pos += 5
-			for i = 1, n do write(v[i]) end
+			grow(st, 5)
+			buffer.writeu8(st.buf, st.pos, T_ARR)
+			buffer.writeu32(st.buf, st.pos + 1, n)
+			st.pos += 5
+			for i = 1, n do write(st, v[i]) end
 		else
-			grow(5)
-			buffer.writeu8(pool, pos, T_MAP)
+			grow(st, 5)
+			buffer.writeu8(st.buf, st.pos, T_MAP)
 			local count = 0; for _ in v do count += 1 end
-			buffer.writeu32(pool, pos + 1, count); pos += 5
-			for k, val in v do write(k); write(val) end
+			buffer.writeu32(st.buf, st.pos + 1, count); st.pos += 5
+			for k, val in v do write(st, k); write(st, val) end
 		end
 	elseif typeof(v) == "buffer" then
 		local len = buffer.len(v)
-		grow(5 + len)
-		buffer.writeu8(pool, pos, T_BUF)
-		buffer.writeu32(pool, pos + 1, len)
-		buffer.copy(pool, pos + 5, v, 0, len)
-		pos += 5 + len
+		grow(st, 5 + len)
+		buffer.writeu8(st.buf, st.pos, T_BUF)
+		buffer.writeu32(st.buf, st.pos + 1, len)
+		buffer.copy(st.buf, st.pos + 5, v, 0, len)
+		st.pos += 5 + len
 	else
 		-- roblox type centralization
 		local typeName = typeof(v)
@@ -148,27 +165,27 @@ local function write(v)
 		if info then
 			local stride = info.stride
 			if stride > 0 then
-				grow(1 + stride)
-				buffer.writeu8(pool, pos, info.id)
-				info.encode(pool, pos + 1, v)
-				pos += 1 + stride
+				grow(st, 1 + stride)
+				buffer.writeu8(st.buf, st.pos, info.id)
+				info.encode(st.buf, st.pos + 1, v)
+				st.pos += 1 + stride
 			else
 				-- variable length (sequences)
-				grow(1024)
-				buffer.writeu8(pool, pos, info.id)
-				local startPos = pos + 1
-				info.encode(pool, startPos, v)
+				grow(st, 1024)
+				buffer.writeu8(st.buf, st.pos, info.id)
+				local startPos = st.pos + 1
+				info.encode(st.buf, startPos, v)
 				if typeName == "ColorSequence" then
-					pos = startPos + 1 + (#(v :: any).Keypoints * 16)
+					st.pos = startPos + 1 + (#(v :: any).Keypoints * 16)
 				elseif typeName == "NumberSequence" then
-					pos = startPos + 1 + (#(v :: any).Keypoints * 12)
+					st.pos = startPos + 1 + (#(v :: any).Keypoints * 12)
 				else
-					pos = startPos + 1 -- fallback for empty or unknown var-len
+					st.pos = startPos + 1 -- fallback for empty or unknown var-len
 				end
 			end
 		else
 			warn("unsupported type: " .. typeName)
-			grow(1); buffer.writeu8(pool, pos, T_NIL); pos += 1
+			grow(st, 1); buffer.writeu8(st.buf, st.pos, T_NIL); st.pos += 1
 		end
 	end
 end
@@ -263,11 +280,11 @@ local function read(buf, offset)
 end
 
 function lib.encode(v, startIdx, endIdx)
-	pos = 0
+	local st = acquire()
 	if startIdx and endIdx and type(v) == "table" then
 		local n = endIdx - startIdx + 1
 
-		-- V16 Schema Compression Detection
+		-- schema compression detection
 		local first = v[startIdx]
 		if type(first) == "table" and next(first) ~= nil and first[1] == nil then
 			local keys = {}
@@ -291,28 +308,30 @@ function lib.encode(v, startIdx, endIdx)
 				end
 
 				if homogeneous then
-					grow(6)
-					buffer.writeu8(pool, pos, T_SMAP)
-					buffer.writeu32(pool, pos + 1, n)
-					buffer.writeu8(pool, pos + 5, keyCount)
-					pos += 6
-					for _, k in keys do write(k) end
+					grow(st, 6)
+					buffer.writeu8(st.buf, st.pos, T_SMAP)
+					buffer.writeu32(st.buf, st.pos + 1, n)
+					buffer.writeu8(st.buf, st.pos + 5, keyCount)
+					st.pos += 6
+					for _, k in keys do write(st, k) end
 					for i = startIdx, endIdx do
 						local item = v[i]
-						for _, k in keys do write(item[k]) end
+						for _, k in keys do write(st, item[k]) end
 					end
-					local res = buffer.create(pos); buffer.copy(res, 0, pool, 0, pos)
+					local res = buffer.create(st.pos); buffer.copy(res, 0, st.buf, 0, st.pos)
+					release(st)
 					return res
 				end
 			end
 		end
 
-		grow(5); buffer.writeu8(pool, pos, T_ARR); buffer.writeu32(pool, pos + 1, n); pos += 5
-		for i = startIdx, endIdx do write(v[i]) end
+		grow(st, 5); buffer.writeu8(st.buf, st.pos, T_ARR); buffer.writeu32(st.buf, st.pos + 1, n); st.pos += 5
+		for i = startIdx, endIdx do write(st, v[i]) end
 	else
-		write(v)
+		write(st, v)
 	end
-	local res = buffer.create(pos); buffer.copy(res, 0, pool, 0, pos)
+	local res = buffer.create(st.pos); buffer.copy(res, 0, st.buf, 0, st.pos)
+	release(st)
 	return res
 end
 
