@@ -1,6 +1,6 @@
 # Nimbus Parallel Flow
 
-A parallel processing library for Roblox. It distributes work across worker `Actor`s, runs it in parallel, and returns the results in order. The actor messaging, binary serialization, and thread synchronization are handled internally.
+A parallel processing library for Roblox. It distributes work across worker Actors, runs it in parallel, and returns the results in order. The actor messaging, binary serialization, and thread synchronization are handled internally.
 
 A worker is a plain function applied to each element of an input. The library decides whether to run that work sequentially or split it across the workers, based on a cost estimate. Small inputs run sequentially, because the round-trip cost of crossing the actor boundary is higher than the compute. Larger inputs are chunked across the pool.
 
