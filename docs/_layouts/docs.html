@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ page.title }} · {{ site.title }}</title>
+  <link rel="stylesheet" href="{{ '/assets/style.css' | relative_url }}">
+</head>
+
+<body>
+  <div class="container">
+
+    <aside class="sidebar">
+      <h3>{{ site.title }}</h3>
+      <nav>
+        <a href="{{ '/' | relative_url }}"{% if page.url == '/' %} class="active"{% endif %}>Home</a>
+        <a href="{{ '/benchmarks/' | relative_url }}"{% if page.url == '/benchmarks/' %} class="active"{% endif %}>Benchmarks</a>
+
+        <span class="group">Getting started</span>
+        <a href="{{ '/installation/' | relative_url }}"{% if page.url == '/installation/' %} class="active"{% endif %}>Installation</a>
+        <a href="{{ '/quickstart/' | relative_url }}"{% if page.url == '/quickstart/' %} class="active"{% endif %}>Quickstart</a>
+        <a href="{{ '/types/' | relative_url }}"{% if page.url == '/types/' %} class="active"{% endif %}>Types</a>
+
+        <span class="group">API</span>
+        <a href="{{ '/general/' | relative_url }}"{% if page.url == '/general/' %} class="active"{% endif %}>General</a>
+        <a href="{{ '/mapping/' | relative_url }}"{% if page.url == '/mapping/' %} class="active"{% endif %}>Mapping</a>
+        <a href="{{ '/async/' | relative_url }}"{% if page.url == '/async/' %} class="active"{% endif %}>Async &amp; Futures</a>
+        <a href="{{ '/errors/' | relative_url }}"{% if page.url == '/errors/' %} class="active"{% endif %}>Error handling</a>
+        <a href="{{ '/cleanup/' | relative_url }}"{% if page.url == '/cleanup/' %} class="active"{% endif %}>Cleanup</a>
+      </nav>
+    </aside>
+
+    <main class="content">
+      <h1>{{ page.title }}</h1>
+      {{ content }}
+    </main>
+
+  </div>
+</body>
+</html>

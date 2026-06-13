@@ -1,0 +1,18 @@
+title: Nimbus Parallel Flow
+description: A parallel processing library for Roblox.
+
+# If this site is served as a project page (username.github.io/REPO),
+# set baseurl to "/REPO". Leave empty for a user/org page or local serving.
+baseurl: ""
+
+markdown: kramdown
+
+# Apply the docs layout to every page so the front matter stays short.
+defaults:
+  - scope:
+      path: ""
+    values:
+      layout: docs
+
+exclude:
+  - README.md
