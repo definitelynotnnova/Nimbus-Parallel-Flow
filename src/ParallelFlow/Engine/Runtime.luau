@@ -5,12 +5,12 @@ local history = {}
 local warmedUp = {}
 local MAX_CACHE = 50
 
--- helper to get and cache modules
+-- caches modules
 local function loadModule(mod, idx)
 	local c = cache[mod]
 	if c then return c end
 
-	-- roblox won't let us require in parallel, so we jump to serial
+	-- sync for require
 	task.synchronize()
 	local ok, fn = pcall(require, mod)
 	if ok then
@@ -31,7 +31,7 @@ local function loadModule(mod, idx)
 	return cache[mod]
 end
 
--- deep promote sharedtables to plain tables
+-- promotes sharedtables
 local function promote(val)
 	if typeof(val) == "SharedTable" or type(val) == "table" then
 		local t = {}
@@ -80,6 +80,39 @@ function Runtime.start(actor, Lib)
 		warmedUp[mod] = true
 	end)
 
+	-- coalesced submit
+	actor:BindToMessageParallel("pf_batch", function(mods, argsBuf)
+		local t0 = os.clock()
+		local args = Serializer.decode(argsBuf)
+		if not args then return end
+
+		local n = #args
+		local out = table.create(n)
+		local errs = nil
+
+		for i = 1, n do
+			local fn = loadModule(mods[i], wid)
+			if fn then
+				local ok, res = pcall(fn, args[i])
+				if ok then
+					out[i] = res
+				else
+					errs = errs or {}
+					errs[#errs + 1] = { index = i, message = tostring(res) }
+				end
+			else
+				errs = errs or {}
+				errs[#errs + 1] = { index = i, message = "module load failed" }
+			end
+		end
+
+		local elapsed = (os.clock() - t0) * 1000
+		task.synchronize()
+		actor:SetAttribute("PF_LastRunMs", elapsed)
+		-- encode out and handle errors
+		event:Fire(wid, Serializer.encode(out, 1, n), errs == nil, errs)
+	end)
+
 	task.synchronize()
 	event:Fire(wid) -- handshake
 
@@ -94,17 +127,25 @@ function Runtime.start(actor, Lib)
 
 		local n = #data
 		local out = table.create(n)
-		local failed = false
+		local errs = nil
 
+		-- per-element isolation
 		for i = 1, n do
 			local ok, res = pcall(fn, data[i])
-			if ok then out[i] = res else failed = true break end
+			if ok then
+				out[i] = res
+			else
+				errs = errs or {}
+				errs[#errs + 1] = { index = i, message = tostring(res) }
+			end
 		end
 
 		local elapsed = (os.clock() - t0) * 1000
 		task.synchronize()
 		actor:SetAttribute("PF_LastRunMs", elapsed)
-		event:Fire(wid, not failed and Serializer.encode(out) or nil, not failed)
+		-- fast encode when clean; hole-safe encode(out,1,n) only when gaps exist
+		local payload = (errs == nil) and Serializer.encode(out) or Serializer.encode(out, 1, n)
+		event:Fire(wid, payload, errs == nil, errs)
 	end)
 
 	-- sharedtable map
@@ -115,18 +156,24 @@ function Runtime.start(actor, Lib)
 
 		local n = finish - start + 1
 		local out = table.create(n)
-		local failed = false
+		local errs = nil
 
 		for i = 1, n do
 			local val = shared[start + i - 1]
 			local ok, res = pcall(fn, promote(val))
-			if ok then out[i] = res else failed = true break end
+			if ok then
+				out[i] = res
+			else
+				errs = errs or {}
+				errs[#errs + 1] = { index = i, message = tostring(res) }
+			end
 		end
 
 		local elapsed = (os.clock() - t0) * 1000
 		task.synchronize()
 		actor:SetAttribute("PF_LastRunMs", elapsed)
-		event:Fire(wid, not failed and Serializer.encode(out) or nil, not failed)
+		local payload = (errs == nil) and Serializer.encode(out) or Serializer.encode(out, 1, n)
+		event:Fire(wid, payload, errs == nil, errs)
 	end)
 
 	-- binary buffer map
@@ -195,7 +242,7 @@ function Runtime.start(actor, Lib)
 		local elapsed = (os.clock() - t0) * 1000
 		task.synchronize()
 		actor:SetAttribute("PF_LastRunMs", elapsed)
-		event:Fire(wid, ok and Serializer.encode(res) or nil, ok)
+		event:Fire(wid, ok and res or nil, ok)
 	end)
 end
 
